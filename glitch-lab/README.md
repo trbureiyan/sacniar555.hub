@@ -71,7 +71,11 @@ el seguimiento se vaya a los destellos del agua). `--smooth` suavizado de la caj
 ## Limitaciones conocidas
 
 - La detección busca "blanco poco saturado": sirve para este ganso, no para cualquier sujeto.
-- Cuando el ganso nada hacia la cámara (último segundo del video), la espuma de la estela
-  entra en la máscara.
+- Máscara: semilla blanca a nivel de píxel, pasos cortos por grises claros para cruzar la
+  cara gris hasta la cabeza, crecimiento solo por tonos naranja/rosado para el pico, y una
+  "cerca" del 5 % del ancho para que no se derrame. Funciona bien con el ganso solo
+  (fotograma 4,5 s, primeros ~2 s del video).
+- En video, cuando los gansos se tocan la máscara se contagia al ganso gris, y con agua muy
+  rizada o espuma (último tramo) se cuelan manchas de agua.
 - El datamosh se probó y se descartó: el codificador MPEG-4 refrescaba la imagen en ~10
   fotogramas tras el corte, y el estilo buscado es otro.

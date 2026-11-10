@@ -25,7 +25,7 @@ import os
 import sys
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ffio import VideoWriter, probe, read_frames  # noqa: E402
@@ -56,7 +56,7 @@ def _components(m):
 
 
 def detect_white_subject(f, thresh=165, sat=0.22, erode=5, scale=None, min_px=12, prev=None,
-                         grow=5, bg_dist=60):
+                         grow_frac=0.05, short_frac=0.02, feather_min=115):
     """Busca el sujeto blanco. Devuelve (máscara suave 0..1, caja x0,y0,x1,y1) o (None, None).
 
     Puntuación de cada mancha = área * compacidad^2, penalizada por la distancia a
@@ -94,17 +94,63 @@ def detect_white_subject(f, thresh=165, sat=0.22, erode=5, scale=None, min_px=12
     ys, xs = best
     sm = np.zeros_like(small)
     sm[ys, xs] = True
-    # zona de búsqueda: la mancha crecida ~grow celdas (recupera cuello, cabeza, pico)
-    grown = Image.fromarray((sm * 255).astype(np.uint8)).filter(ImageFilter.MaxFilter(2 * grow + 1))
-    region = np.asarray(grown.resize((w // scale * scale, h // scale * scale), Image.NEAREST)) > 0
-    region = np.pad(region, ((0, h - region.shape[0]), (0, w - region.shape[1])))
-    # dentro de la zona: todo lo que se aleja del color típico del fondo
-    bg = np.median(rgb[::8, ::8].reshape(-1, 3), axis=0)
-    dist = np.sqrt(((rgb - bg) ** 2).sum(2))
-    m = Image.fromarray(((region & (dist > bg_dist)) * 255).astype(np.uint8))
-    m = m.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.MaxFilter(5))   # quita motas
-    m = m.filter(ImageFilter.GaussianBlur(1.2))
-    mm = np.asarray(m) > 128
+    # Máscara fina en 3 etapas (en un recorte alrededor de la mancha elegida):
+    #  1) semilla = la mancha blanca conectada a nivel de píxel (no de rejilla)
+    #  2) pasos CORTOS hacia grises claros + relleno del blanco conectado (cruza la cara gris)
+    #  3) crecimiento LARGO solo hacia naranja/rosado (pico): el agua nunca es de ese tono
+    # Crecer "hacia todo lo que no sea agua" se colaba en los reflejos del agua rizada.
+    core = np.asarray(Image.fromarray((sm * 255).astype(np.uint8))
+                      .resize((w // scale * scale, h // scale * scale), Image.NEAREST)) > 0
+    core = np.pad(core, ((0, h - core.shape[0]), (0, w - core.shape[1])))
+    reach = int(grow_frac * w)
+    y0, y1 = max(0, ys.min() * scale - reach), min(h, (ys.max() + 1) * scale + reach)
+    x0, x1 = max(0, xs.min() * scale - reach), min(w, (xs.max() + 1) * scale + reach)
+    crop = rgb[y0:y1, x0:x1]
+    cmx, cmn = crop.max(2), crop.min(2)
+    csat = (cmx - cmn) / (cmx + 1)
+    r, g, b_ = crop[..., 0], crop[..., 1], crop[..., 2]
+    k = 3 if w <= 1280 else 5
+
+    def opened(mk):  # apertura fina: borra reflejos del agua de 1-3 px que hacen de puente
+        im = Image.fromarray(mk.astype(np.uint8) * 255)
+        return np.asarray(im.filter(ImageFilter.MinFilter(k)).filter(ImageFilter.MaxFilter(k))) > 0
+
+    # cerca: nada crece más allá de 'reach' alrededor de la mancha detectada
+    fence = np.asarray(Image.fromarray((core[y0:y1, x0:x1] * 255).astype(np.uint8))
+                       .filter(ImageFilter.MaxFilter(2 * reach + 1))) > 0
+    wcrop = opened(white[y0:y1, x0:x1]) & fence
+    plumage = (opened((cmn > feather_min) & (csat < 0.2)) | wcrop) & fence
+    beak = (r > 140) & (r - g > 25) & (r - b_ > 10) & fence
+
+    def grow(cur, allowed, px):
+        cur_i = Image.fromarray(cur.astype(np.uint8) * 255)
+        al = allowed.astype(np.uint8) * 255
+        for _ in range(max(1, px // 2)):
+            nxt = np.minimum(np.asarray(cur_i.filter(ImageFilter.MaxFilter(5))), al)
+            if np.array_equal(nxt, np.asarray(cur_i)):
+                break
+            cur_i = Image.fromarray(nxt)
+        return np.asarray(cur_i) > 0
+
+    cur = grow(core[y0:y1, x0:x1] & wcrop, wcrop, 4 * reach)   # mancha blanca real, px a px
+    for _ in range(2):
+        # la cabeza blanca está separada del cuello por la cara gris: se cruza el gris
+        # con un paso corto y se vuelve a rellenar todo el blanco que quede conectado
+        cur = grow(cur, plumage, int(short_frac * w))
+        cur = grow(cur, cur | wcrop, 4 * reach)
+    cur = grow(cur, cur | beak, reach)
+    cur = grow(cur, plumage | cur, int(short_frac * w) // 2)    # bordes grises (coronilla)
+    cur = Image.fromarray(cur.astype(np.uint8) * 255)
+    cur = cur.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
+    # rellena huecos (ojo, comisura del pico): lo negro no conectado al borde es hueco
+    pad = Image.new("L", (cur.width + 2, cur.height + 2), 0)
+    pad.paste(cur, (1, 1))
+    ImageDraw.floodfill(pad, (0, 0), 128)
+    filled = np.where(np.asarray(pad) == 128, 0, 255).astype(np.uint8)[1:-1, 1:-1]
+    full = np.zeros((h, w), np.uint8)
+    full[y0:y1, x0:x1] = filled
+    m = Image.fromarray(full).filter(ImageFilter.GaussianBlur(1.0 * w / 960))
+    mm = full > 128
     if mm.any():
         yy, xx = np.nonzero(mm)
         box = (xx.min(), yy.min(), xx.max() + 1, yy.max() + 1)
