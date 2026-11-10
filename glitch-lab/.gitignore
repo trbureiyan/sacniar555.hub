@@ -1,0 +1,12 @@
+# Regla: el video y sus fotogramas NO salen de esta máquina. Solo se versionan scripts y README.
+input/
+work/
+out/
+sheets/
+test/
+*.mp4
+*.MP4
+*.m4v
+*.png
+*.jpg
+__pycache__/
